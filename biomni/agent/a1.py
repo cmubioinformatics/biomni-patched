@@ -1503,6 +1503,26 @@ Each library is listed with its description to help you understand its functiona
                         import subprocess
                         import sys
 
+                        # ============================================================
+                        # Detect current Python environment
+                        # ============================================================
+                        current_python = sys.executable
+                        current_env_name = os.environ.get('CONDA_DEFAULT_ENV', 'unknown')
+                        print(f"[AUTO-INSTALL] Current Python: {current_python}")
+                        print(f"[AUTO-INSTALL] Current Conda env: {current_env_name}")
+
+                        # Build environment-aware commands
+                        # Use sys.executable to ensure we install to the correct environment
+                        pip_base_cmd = [current_python, "-m", "pip"]
+
+                        # For conda, try to use the conda that manages this environment
+                        conda_exe = os.environ.get('CONDA_EXE', 'conda')
+                        if current_env_name != 'unknown':
+                            conda_base_cmd = [conda_exe, "install", "-y", "-n", current_env_name]
+                        else:
+                            # Fallback to regular conda install if not in a conda env
+                            conda_base_cmd = [conda_exe, "install", "-y"]
+
                         # Ask LLM to provide BOTH conda and pip install commands
                         llm_prompt = f"""The Python package '{missing_package}' is not installed.
 Please provide the installation commands for BOTH conda and pip.
@@ -1516,25 +1536,33 @@ Only provide these two lines, no explanation."""
                         llm_response = self.llm.invoke([HumanMessage(content=llm_prompt)])
                         response_text = llm_response.content.strip()
 
-                        # Extract conda and pip commands
-                        conda_cmd = None
-                        pip_cmd = None
+                        # Extract package names from LLM response
+                        conda_pkg = None
+                        pip_pkg = None
 
                         for line in response_text.split('\n'):
                             line = line.strip()
                             if line.upper().startswith('CONDA:'):
-                                conda_cmd = line.split(':', 1)[1].strip()
+                                # Extract package name from conda command
+                                parts = line.split(':', 1)[1].strip().split()
+                                conda_pkg = parts[-1] if parts else missing_package
                             elif line.upper().startswith('PIP:'):
-                                pip_cmd = line.split(':', 1)[1].strip()
+                                # Extract package name from pip command
+                                parts = line.split(':', 1)[1].strip().split()
+                                pip_pkg = parts[-1] if parts else missing_package
 
-                        # Fallback to basic commands if extraction failed
-                        if not conda_cmd:
-                            conda_cmd = f"conda install -y {missing_package}"
-                        if not pip_cmd:
-                            pip_cmd = f"pip install {missing_package}"
+                        # Fallback to missing package name
+                        if not conda_pkg:
+                            conda_pkg = missing_package
+                        if not pip_pkg:
+                            pip_pkg = missing_package
 
-                        print(f"[AUTO-INSTALL] Conda command: {conda_cmd}")
-                        print(f"[AUTO-INSTALL] Pip command: {pip_cmd}")
+                        # Build full commands
+                        conda_cmd = conda_base_cmd + [conda_pkg]
+                        pip_cmd = pip_base_cmd + ["install", pip_pkg]
+
+                        print(f"[AUTO-INSTALL] Conda command: {' '.join(conda_cmd)}")
+                        print(f"[AUTO-INSTALL] Pip command: {' '.join(pip_cmd)}")
 
                         installed = False
                         failure_reasons = []
@@ -1543,35 +1571,29 @@ Only provide these two lines, no explanation."""
                         print(f"[AUTO-INSTALL] Trying conda installation...")
                         try:
                             install_result = subprocess.run(
-                                conda_cmd.split(),
+                                conda_cmd,
                                 capture_output=True,
                                 text=True,
                                 timeout=180
                             )
 
-                            # Verify with conda list
+                            # Verify by trying to import the package
                             if install_result.returncode == 0:
                                 print(f"[AUTO-INSTALL] Conda command executed, verifying...")
-                                verify_result = subprocess.run(
-                                    ["conda", "list"],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=30
-                                )
-
-                                # Check if package appears in conda list
-                                if verify_result.returncode == 0:
-                                    # Extract package name from command for verification
-                                    pkg_name = conda_cmd.split()[-1].strip().strip("'\"")
-                                    # Check both exact match and partial match (some packages have different names)
-                                    if pkg_name.lower() in verify_result.stdout.lower() or missing_package.lower() in verify_result.stdout.lower():
-                                        print(f"[AUTO-INSTALL] Successfully verified via conda list")
+                                try:
+                                    # Try to import the package to verify installation
+                                    import importlib
+                                    importlib.invalidate_caches()
+                                    spec = importlib.util.find_spec(missing_package.split('.')[0])
+                                    if spec is not None:
+                                        print(f"[AUTO-INSTALL] Successfully verified via import test")
                                         installed = True
                                     else:
-                                        print(f"[AUTO-INSTALL] Conda command succeeded but package not found in 'conda list'")
-                                        failure_reasons.append(f"Conda: Command succeeded but verification failed (package not in conda list)")
-                                else:
-                                    failure_reasons.append(f"Conda: Verification command failed")
+                                        print(f"[AUTO-INSTALL] Conda command succeeded but package still not importable")
+                                        failure_reasons.append(f"Conda: Command succeeded but import test failed")
+                                except (ImportError, ModuleNotFoundError, ValueError):
+                                    print(f"[AUTO-INSTALL] Conda command succeeded but package not found")
+                                    failure_reasons.append(f"Conda: Command succeeded but verification failed (package not importable)")
                             else:
                                 failure_reasons.append(f"Conda: {install_result.stderr.strip() or install_result.stdout.strip()}")
                         except subprocess.TimeoutExpired:
@@ -1584,30 +1606,29 @@ Only provide these two lines, no explanation."""
                             print(f"[AUTO-INSTALL] Conda failed, trying pip installation...")
                             try:
                                 install_result = subprocess.run(
-                                    pip_cmd.split(),
+                                    pip_cmd,
                                     capture_output=True,
                                     text=True,
                                     timeout=180
                                 )
 
-                                # Verify with pip show
+                                # Verify by trying to import the package
                                 if install_result.returncode == 0:
                                     print(f"[AUTO-INSTALL] Pip command executed, verifying...")
-                                    # Extract package name from command for verification
-                                    pkg_name = pip_cmd.split()[-1].strip().strip("'\"")
-                                    verify_result = subprocess.run(
-                                        ["pip", "show", pkg_name],
-                                        capture_output=True,
-                                        text=True,
-                                        timeout=30
-                                    )
-
-                                    if verify_result.returncode == 0:
-                                        print(f"[AUTO-INSTALL] Successfully verified via pip show")
-                                        installed = True
-                                    else:
-                                        print(f"[AUTO-INSTALL] Pip command succeeded but verification failed")
-                                        failure_reasons.append(f"Pip: Command succeeded but 'pip show {pkg_name}' failed")
+                                    try:
+                                        # Try to import the package to verify installation
+                                        import importlib
+                                        importlib.invalidate_caches()
+                                        spec = importlib.util.find_spec(missing_package.split('.')[0])
+                                        if spec is not None:
+                                            print(f"[AUTO-INSTALL] Successfully verified via import test")
+                                            installed = True
+                                        else:
+                                            print(f"[AUTO-INSTALL] Pip command succeeded but package still not importable")
+                                            failure_reasons.append(f"Pip: Command succeeded but import test failed")
+                                    except (ImportError, ModuleNotFoundError, ValueError):
+                                        print(f"[AUTO-INSTALL] Pip command succeeded but package not found")
+                                        failure_reasons.append(f"Pip: Command succeeded but verification failed")
                                 else:
                                     failure_reasons.append(f"Pip: {install_result.stderr.strip() or install_result.stdout.strip()}")
                             except subprocess.TimeoutExpired:
